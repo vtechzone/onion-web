@@ -34,6 +34,72 @@ die() {
     exit 1
 }
 
+# ─── Progress bar tổng thể (theo bước) ───────────────────────────────────────
+TOTAL_STEPS=6
+draw_overall_progress() {
+    local step=$1
+    local pct=$(( step * 100 / TOTAL_STEPS ))
+    local filled=$(( step * 28 / TOTAL_STEPS ))
+    local empty=$(( 28 - filled ))
+    local bar=""
+    for ((i=0; i<filled; i++)); do bar+="█"; done
+    for ((i=0; i<empty;  i++)); do bar+="░"; done
+    echo -e "  ${CYAN}Tiến trình tổng thể:${NC} [${GREEN}${bar}${NC}] ${BOLD}${pct}%${NC} (${step}/${TOTAL_STEPS} bước)\n"
+}
+
+# ─── Progress bar cài đặt gói (theo gói) ─────────────────────────────────────
+# Dùng dry-run để đếm số gói cần cài, sau đó track "Unpacking" + "Setting up"
+apt_install_with_progress() {
+    local packages=("$@")
+
+    # Đếm tổng số gói (bao gồm dependencies) qua dry-run
+    local total
+    total=$(DEBIAN_FRONTEND=noninteractive apt-get install -y --dry-run \
+        -o Dpkg::Options::="--force-confnew" "${packages[@]}" 2>/dev/null \
+        | grep -c "^Inst " || true)
+    [[ "$total" -eq 0 ]] && total=1  # tránh chia 0
+
+    local current=0
+    local pkg_name=""
+
+    _draw_pkg_bar() {
+        local cur=$1 tot=$2 name=$3
+        local pct=$(( cur * 100 / tot ))
+        local filled=$(( cur * 28 / tot ))
+        local empty=$(( 28 - filled ))
+        local bar=""
+        for ((i=0; i<filled; i++)); do bar+="█"; done
+        for ((i=0; i<empty;  i++)); do bar+="░"; done
+        # \r để ghi đè dòng hiện tại
+        printf "\r  📦 [${GREEN}%s${NC}] ${BOLD}%3d%%${NC}  %-35s" "$bar" "$pct" "$name"
+    }
+
+    # In bar khởi đầu 0%
+    _draw_pkg_bar 0 "$total" "Đang chuẩn bị..."
+
+    # Chạy apt-get, bắt từng dòng output
+    DEBIAN_FRONTEND=noninteractive apt-get install -y \
+        -o Dpkg::Options::="--force-confnew" "${packages[@]}" 2>&1 \
+    | while IFS= read -r line; do
+        if [[ "$line" =~ ^(Get|Ign|Hit):[0-9] ]]; then
+            # Đang tải — lấy tên gói từ dòng (trường cuối trước kích thước)
+            pkg_name=$(echo "$line" | awk '{print $NF}' | sed 's/\[.*//;s/ .*//')
+            _draw_pkg_bar "$current" "$total" "Tải: ${pkg_name}"
+        elif [[ "$line" =~ ^Unpacking\ ([^ ]+) ]]; then
+            pkg_name="${BASH_REMATCH[1]}"
+            (( current++ )) || true
+            _draw_pkg_bar "$current" "$total" "Giải nén: ${pkg_name}"
+        elif [[ "$line" =~ ^Setting\ up\ ([^ ]+) ]]; then
+            pkg_name="${BASH_REMATCH[1]}"
+            _draw_pkg_bar "$current" "$total" "Thiết lập: ${pkg_name}"
+        fi
+    done
+
+    # Đảm bảo bar hiển thị 100% khi xong
+    _draw_pkg_bar "$total" "$total" "Hoàn tất!"
+    echo ""  # xuống dòng sau bar
+}
+
 # ─── Kiểm tra quyền root ─────────────────────────────────────────────────────
 [[ "$EUID" -ne 0 ]] && die "Vui lòng chạy script với quyền root: sudo $0"
 
@@ -46,13 +112,19 @@ echo -e "${NC}"
 
 # ─── Bước 1: Cài đặt các gói phụ thuộc ──────────────────────────────────────
 log_step 1 "Cập nhật hệ thống và cài đặt các gói cần thiết..."
+draw_overall_progress 0
 
+echo -e "  🔄 Đang cập nhật danh sách gói (apt-get update)..."
 apt-get update -y -qq
-apt-get install -y -qq tor nginx curl
+log_ok "Danh sách gói đã được cập nhật"
+
+echo ""
+apt_install_with_progress tor nginx curl
 log_ok "Đã cài đặt: tor, nginx, curl"
 
 systemctl enable --now tor nginx
 log_ok "Đã bật dịch vụ tor và nginx"
+draw_overall_progress 1
 
 # ─── Bước 2: Tạo thư mục và trang web mẫu ───────────────────────────────────
 log_step 2 "Tạo thư mục trang web và file index.html..."
@@ -87,6 +159,7 @@ HTML
 chown -R www-data:www-data "$WEB_DIR"
 chmod -R 755 "$WEB_DIR"
 log_ok "Đã tạo trang web tại $WEB_DIR"
+draw_overall_progress 2
 
 # ─── Bước 3: Cấu hình Nginx ──────────────────────────────────────────────────
 log_step 3 "Cấu hình Nginx lắng nghe trên Unix Domain Socket..."
@@ -121,6 +194,7 @@ NGINX
 # Kích hoạt site, xóa liên kết cũ nếu có
 ln -sf "$NGINX_CONF" "/etc/nginx/sites-enabled/myonionsite"
 log_ok "Đã tạo cấu hình Nginx tại $NGINX_CONF"
+draw_overall_progress 3
 
 # ─── Bước 4: Kiểm tra và khởi động lại Nginx ─────────────────────────────────
 log_step 4 "Kiểm tra cấu hình và khởi động lại Nginx..."
@@ -147,6 +221,7 @@ else
     die "Không tìm thấy user Tor (debian-tor hoặc tor). Kiểm tra cài đặt Tor."
 fi
 log_ok "User Tor: ${TOR_USER}"
+draw_overall_progress 4
 
 # ─── Bước 5: Cấu hình Tor ────────────────────────────────────────────────────
 log_step 5 "Cấu hình Tor Hidden Service..."
@@ -167,6 +242,7 @@ HiddenServicePort 80 unix:${NGINX_SOCKET}
 TOR
     log_ok "Đã thêm cấu hình vào ${TORRC_FILE}"
 fi
+draw_overall_progress 5
 
 # ─── Bước 6: Khởi động lại Tor và lấy địa chỉ .onion ────────────────────────
 log_step 6 "Khởi động lại Tor và lấy địa chỉ .onion..."
@@ -188,6 +264,7 @@ if [[ ! -f "$HOSTNAME_FILE" ]]; then
 fi
 
 ONION_ADDRESS=$(cat "$HOSTNAME_FILE")
+draw_overall_progress 6
 
 # ─── Kết quả ─────────────────────────────────────────────────────────────────
 echo ""
